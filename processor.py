@@ -85,37 +85,51 @@ def detect_semantics(df: pd.DataFrame, start: int, end: int) -> Dict[Tuple[int,i
     return sem
 
 
-def extract_base_values(df: pd.DataFrame, start: int, end: int, denom_value: float) -> Dict[str, Dict[str,float]]:
+def extract_base_values_from_pair(df: pd.DataFrame,
+                                  tmpl_start: int, tmpl_end: int,
+                                  val_start: int, val_end: int,
+                                  denom_value: float) -> Dict[str, Dict[str,float]]:
+    """
+    Extract base values where labels live in the template block (tmpl_*)
+    and numbers live in the value block (val_*) at the same column offset.
+    """
     base: Dict[str, Dict[str,float]] = {}
-    for r in range(df.shape[0]):
-        for c in range(start, end):
-            label = str(df.iat[r,c]).strip()
-            if label in SEMANTIC_LABELS:
-                num = clean_number(df.iat[r, c+1])
-                if num is not None:
-                    base[label] = {"credits": num, "cash": round(num*denom_value,2)}
-    # Keep only leaf labels and role labels that define bases
     keep = {"Max","Mor","Mini","g","h","i","d","e","f","a","b","c"}
-    return {k:v for k,v in base.items() if k in keep}
+    width = min(tmpl_end - tmpl_start, val_end - val_start)
+    for r in range(df.shape[0]):
+        for c in range(tmpl_start, tmpl_end+1):
+            label = str(df.iat[r, c]).strip()
+            if label in keep:
+                offset = c - tmpl_start
+                val_c = val_start + offset
+                if val_start <= val_c <= val_end:
+                    num = clean_number(df.iat[r, val_c])
+                    if num is not None:
+                        base[label] = {"credits": num, "cash": round(num*denom_value, 2)}
+    return base
 
 
 def find_canonical_per_family(df: pd.DataFrame, blocks: List[Tuple[int,int]]):
+    """Choose canonical value blocks per family; semantics come from the left template block."""
     fam_to_canon = {}
-    for start,end in blocks:
+    for idx, (start, end) in enumerate(blocks):
         key, denom, _ = parse_block_denom(df, start, end)
         fam = family_of(key)
         if fam == "unknown" or denom == 0:
             continue
-        bases = extract_base_values(df, start, end, denom)
-        has_core = all(k in bases for k in ["Max","Mor","Mini"]) if fam=="credit" else True
-        # prefer exact canonical denomination
-        canon_tok, canon_val = FAMILY_CANONICAL_KEYS.get(fam, (None,None))
-        if canon_tok and key.startswith(canon_tok):
-            fam_to_canon[fam] = (start,end,denom,key,detect_semantics(df,start,end),bases)
+        # template block is the immediate left block
+        if idx == 0:
             continue
-        # otherwise take the first with sufficient bases
+        tmpl_start, tmpl_end = blocks[idx-1]
+        semantics = detect_semantics(df, tmpl_start, tmpl_end)
+        bases = extract_base_values_from_pair(df, tmpl_start, tmpl_end, start, end, denom)
+        has_core = all(k in bases for k in ["Max","Mor","Mini"]) if fam=="credit" else True
+        canon_tok, _ = FAMILY_CANONICAL_KEYS.get(fam, (None, None))
+        if canon_tok and key.startswith(canon_tok):
+            fam_to_canon[fam] = (start, end, denom, key, semantics, bases, tmpl_start, tmpl_end)
+            continue
         if fam not in fam_to_canon and bases:
-            fam_to_canon[fam] = (start,end,denom,key,detect_semantics(df,start,end),bases)
+            fam_to_canon[fam] = (start, end, denom, key, semantics, bases, tmpl_start, tmpl_end)
     return fam_to_canon
 
 
@@ -150,42 +164,57 @@ def parse_multiplier(label: str) -> Optional[int]:
 
 def update_in_place(df: pd.DataFrame, mapping: Dict[str, Dict[str,Any]], blocks: List[Tuple[int,int]]) -> pd.DataFrame:
     updated = df.copy()
-    for start,end in blocks:
+    for idx, (start, end) in enumerate(blocks):
         key, _, _ = parse_block_denom(df, start, end)
         info = mapping.get(key)
         if not info:
             continue
         base_vals = info.get("base_values", {})
         semantics = info.get("semantic_template", {})
-        # write numbers to the immediate right of labels
-        for (r,c), label in semantics.items():
-            if label in base_vals and c+1 <= end:
-                updated.iat[r, c+1] = base_vals[label]["credits"] if info["family"]=="credit" else f"${int(base_vals[label]['credits']) if base_vals[label]['credits'].is_integer() else base_vals[label]['credits']}"
-        # compute derived xN values based on nearest-left base in the same row
-        # build left-to-right ordered positions per row
+        tmpl_start = info.get("template_start")
+        tmpl_end = info.get("template_end")
+        if tmpl_start is None:
+            # fallback to immediate left block
+            if idx > 0:
+                tmpl_start, tmpl_end = blocks[idx-1]
+            else:
+                continue
+        # write base numbers into value block columns aligned by offset from template
+        for (r, c_label), label in semantics.items():
+            if label in base_vals:
+                offset = c_label - tmpl_start
+                val_c = start + offset
+                if start <= val_c <= end:
+                    if info["family"] == "credit":
+                        updated.iat[r, val_c] = base_vals[label]["credits"]
+                    else:
+                        num = base_vals[label]["credits"]
+                        updated.iat[r, val_c] = f"${int(num) if float(num).is_integer() else num}"
+        # compute derived xN values using nearest-left base label per row (in template), write into aligned value column
         row_positions: Dict[int, List[Tuple[int, str]]] = defaultdict(list)
-        for (r,c), label in semantics.items():
-            row_positions[r].append((c, label))
+        for (r, c_label), lab in semantics.items():
+            row_positions[r].append((c_label, lab))
         for r in row_positions:
             row_positions[r].sort(key=lambda t: t[0])
         for r, entries in row_positions.items():
             last_base_label: Optional[str] = None
-            for c, label in entries:
-                if label in BASE_LABELS and label in base_vals:
-                    last_base_label = label
+            for c_label, lab in entries:
+                if lab in BASE_LABELS and lab in base_vals:
+                    last_base_label = lab
                     continue
-                mult = parse_multiplier(label)
-                if mult and last_base_label and c+1 <= end and last_base_label in base_vals:
-                    base_num = base_vals[last_base_label]["credits"]
+                mult = parse_multiplier(lab)
+                if mult and last_base_label:
+                    base_num = base_vals.get(last_base_label, {}).get("credits")
+                    if base_num is None:
+                        continue
                     val = base_num * mult
-                    if info["family"] == "credit":
-                        updated.iat[r, c+1] = round(val, 6)
-                    else:
-                        # format dollars; prefer integers without .0
-                        updated.iat[r, c+1] = f"${int(val) if float(val).is_integer() else val}"
-        # also re-write the label itself (in case it was a dot)
-        for (r,c), label in semantics.items():
-            updated.iat[r,c] = label
+                    offset = c_label - tmpl_start
+                    val_c = start + offset
+                    if start <= val_c <= end:
+                        if info["family"] == "credit":
+                            updated.iat[r, val_c] = round(val, 6)
+                        else:
+                            updated.iat[r, val_c] = f"${int(val) if float(val).is_integer() else val}"
     return updated
 
 
@@ -197,12 +226,14 @@ def process_table(table: List[List[Any]]) -> pd.DataFrame:
     mapping: Dict[str, Dict[str,Any]] = {}
     fam_to_canon = find_canonical_per_family(df, blocks)
 
-    for start,end in blocks:
+    for idx, (start,end) in enumerate(blocks):
         key, denom, _ = parse_block_denom(df, start, end)
         fam = family_of(key)
-        semantics = detect_semantics(df, start, end)
+        # semantics come from template block on the left
+        tmpl_start, tmpl_end = blocks[idx-1] if idx > 0 else (None, None)
+        semantics = detect_semantics(df, tmpl_start, tmpl_end) if tmpl_start is not None else {}
         if fam in fam_to_canon:
-            c_start,c_end,c_denom,c_key,c_sem,c_base = fam_to_canon[fam]
+            c_start,c_end,c_denom,c_key,c_sem,c_base,c_tmpl_start,c_tmpl_end = fam_to_canon[fam]
             # Regenerate base values for this block by scaling canonical base
             base_vals = scale_block_base(c_base, c_denom, denom)
             # Use canonical semantics template to propagate into all blocks of the family
@@ -212,17 +243,25 @@ def process_table(table: List[List[Any]]) -> pd.DataFrame:
                 "canonical_base": c_key,
                 "scale_factor": denom / c_denom if c_denom else None,
                 "semantic_template": c_sem,
+                "template_start": tmpl_start,
+                "template_end": tmpl_end,
                 "base_values": base_vals,
             }
         else:
             # Unknown family or missing denom
-            base_vals = extract_base_values(df, start, end, denom)
+            # try extracting from pair with left template if available
+            if tmpl_start is not None:
+                base_vals = extract_base_values_from_pair(df, tmpl_start, tmpl_end, start, end, denom)
+            else:
+                base_vals = {}
             mapping[key] = {
                 "family": fam,
                 "denom_value": denom,
                 "canonical_base": None,
                 "scale_factor": None,
                 "semantic_template": semantics,
+                "template_start": tmpl_start,
+                "template_end": tmpl_end,
                 "base_values": base_vals,
             }
 

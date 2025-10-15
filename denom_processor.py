@@ -30,9 +30,11 @@ BASE_LABELS = {"Max", "Mor", "Mini", "g", "h", "i", "d", "e", "f", "a", "b", "c"
 # Multipliers allowed for derived detection
 DERIVED_MULTIPLIERS = list(range(1, 11))  # 1×..10×
 
-# Preferred canonical denomination per family (used if present; otherwise we fall back dynamically)
-PREFERRED_CANONICAL = {
-    "credit": ("1CT", 0.60),  # choose smallest 1CT value when available
+# Preferred canonical denomination per group (used if present; otherwise we fall back dynamically)
+# credit_low covers 1CT/2CT, credit_hi covers 5CT/10CT
+PREFERRED_GROUP_CANONICAL = {
+    "credit_low": ("1CT", 0.60),
+    "credit_hi": ("5CT", 1.50),
     "$1": ("$1", 10.0),
     "$2": ("$2", 20.0),
 }
@@ -40,6 +42,39 @@ PREFERRED_CANONICAL = {
 # Families and simple detection helpers
 CREDIT_TOKENS = {"1CT", "2CT", "5CT", "10CT"}
 DOLLAR_TOKENS = {"$1", "$2"}
+
+# Explicit family map and scale factors (used as hints and for validation/fallback)
+FAMILY_MAP: Dict[str, str] = {
+    # credit family
+    "1CT $0.60": "credit", "1CT $1.20": "credit", "1CT $1.80": "credit",
+    "1CT $3.00": "credit", "1CT $6.00": "credit",
+    "2CT $1.20": "credit", "2CT $2.40": "credit", "2CT $3.60": "credit",
+    "2CT $6.00": "credit", "2CT $12.00": "credit",
+    "5CT $1.50": "credit", "5CT $3.00": "credit", "5CT $4.50": "credit",
+    "5CT $7.50": "credit", "5CT $15.00": "credit",
+    "10CT $3.00": "credit", "10CT $6.00": "credit", "10CT $9.00": "credit",
+    "10CT $15.00": "credit", "10CT $30.00": "credit",
+
+    # $1 family
+    "$1 $5": "$1", "$1 $10": "$1", "$1 $15": "$1", "$1 $20": "$1", "$1 $25": "$1",
+
+    # $2 family
+    "$2 $10": "$2", "$2 $20": "$2", "$2 $30": "$2", "$2 $40": "$2", "$2 $50": "$2",
+}
+
+SCALE_FACTORS: Dict[str, float] = {
+    # credit family (relative to 1CT $0.60)
+    "1CT $0.60": 1, "1CT $1.20": 2, "1CT $1.80": 3, "1CT $3.00": 5, "1CT $6.00": 10,
+    "2CT $1.20": 2, "2CT $2.40": 4, "2CT $3.60": 6, "2CT $6.00": 10, "2CT $12.00": 20,
+    "5CT $1.50": 2.5, "5CT $3.00": 5, "5CT $4.50": 7.5, "5CT $7.50": 12.5, "5CT $15.00": 25,
+    "10CT $3.00": 5, "10CT $6.00": 10, "10CT $9.00": 15, "10CT $15.00": 25, "10CT $30.00": 50,
+
+    # $1 family (relative to $1 $10)
+    "$1 $10": 1, "$1 $5": 0.5, "$1 $15": 1.5, "$1 $20": 2, "$1 $25": 2.5,
+
+    # $2 family (relative to $2 $20)
+    "$2 $20": 1, "$2 $10": 0.5, "$2 $30": 1.5, "$2 $40": 2, "$2 $50": 2.5,
+}
 
 
 # ==============================
@@ -209,7 +244,18 @@ def choose_canonical_block(blocks: List[DenomBlock]) -> Optional[DenomBlock]:
         return None
 
     family = blocks[0].family
-    pref_token, pref_value = PREFERRED_CANONICAL.get(family, (None, None))
+
+    # Split credit into two subgroups: low (1CT/2CT) vs high (5CT/10CT)
+    if family == "credit":
+        low = [b for b in blocks if any(b.key.startswith(tok) for tok in ("1CT", "2CT"))]
+        hi = [b for b in blocks if any(b.key.startswith(tok) for tok in ("5CT", "10CT"))]
+        # Prefer low group if present, else high group
+        group_blocks = low if low else hi
+        group_key = "credit_low" if low else "credit_hi"
+        pref_token, pref_value = PREFERRED_GROUP_CANONICAL.get(group_key, (None, None))
+    else:
+        # $1 / $2 families use direct preferences
+        pref_token, pref_value = PREFERRED_GROUP_CANONICAL.get(family, (None, None))
 
     # 1) Prefer exact token + closest to preferred denom value
     if pref_token is not None:
@@ -304,7 +350,15 @@ def scale_from_canonical(blocks: List[DenomBlock]) -> Dict[str, Dict[str, Any]]:
 
         # If canonical block lacks bases (e.g., empty), keep empty; we'll just annotate semantics
         for b in fam_blocks:
-            scale = (b.denom_value / c_val) if c_val else 1.0
+            # Use explicit SCALE_FACTORS if keys are recognized; else fall back to denom ratio
+            if canonical.key in SCALE_FACTORS and b.key in SCALE_FACTORS:
+                # scale from canonical by dividing their relative factors
+                # normalize canonical factor to 1 if not present
+                canon_rel = SCALE_FACTORS.get(canonical.key, 1.0)
+                blk_rel = SCALE_FACTORS.get(b.key, b.denom_value / c_val if c_val else 1.0)
+                scale = float(blk_rel) / float(canon_rel) if canon_rel else 1.0
+            else:
+                scale = (b.denom_value / c_val) if c_val else 1.0
 
             # Regenerate/scale base credits from canonical base_values
             regen_base: Dict[str, Dict[str, float]] = {}
@@ -366,6 +420,7 @@ def write_block_labels_and_numbers(
 
     # 3) Overlays: for each 12-row segment, replicate numbers into overlay rows when a clean multiplier is present
     #    without clobbering explicit cash overlays or notes content. This keeps it dynamic.
+    #    This also covers feature grids (FG) rows by preserving any existing non-empty content.
     for base_rng, over_rng in overlay_pairs(df.shape[0]):
         for i, r_base in enumerate(base_rng):
             if r_base >= df.shape[0]:
@@ -421,7 +476,7 @@ def process_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     # Build scaling info from per-family canonical selection
     info_by_key = scale_from_canonical(blocks)
 
-    # Write updates block-by-block
+    # Write updates block-by-block (in input order to preserve left→right dependencies if any)
     for b in blocks:
         info = info_by_key.get(b.key)
         if not info:

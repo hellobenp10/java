@@ -76,6 +76,107 @@ SCALE_FACTORS: Dict[str, float] = {
     "$2 $20": 1, "$2 $10": 0.5, "$2 $30": 1.5, "$2 $40": 2, "$2 $50": 2.5,
 }
 
+# Row → label mapping used for baseline construction and validation
+BASE_ROW_LABELS: Dict[int, List[str]] = {
+    3: ["Max", "Mor", "Mini"],
+    4: ["g", "h", "i"],
+    5: ["d", "e", "f"],
+    6: ["a", "b", "c"],
+}
+
+# Optional baselines for specific canonical product keys.
+# Values are floats (strip any $/comma in the source before adding here).
+# For the credit family, row 3 entries are CASH amounts; rows 4–6 are CREDITS.
+# For $ families, rows 3–6 are CASH amounts.
+BASELINE_ROWS_BY_KEY: Dict[str, Dict[int, List[float]] ] = {
+    # Credit family canonical example
+    "1CT $0.60": {
+        3: [30.0, 15.0, 10.0],
+        4: [1000.0, 500.0, 300.0],
+        5: [200.0, 150.0, 125.0],
+        6: [100.0, 75.0, 60.0],
+    },
+    # Scaled from 1CT $0.60 by 5
+    "1CT $3.00": {
+        3: [150.0, 75.0, 50.0],
+        4: [5000.0, 2500.0, 1500.0],
+        5: [1000.0, 750.0, 625.0],
+        6: [500.0, 375.0, 300.0],
+    },
+    # $2 family example (given for $2 $50.00)
+    "$2 $50.00": {
+        3: [80.0, 60.0, 50.0],
+        4: [2500.0, 1250.0, 750.0],
+        5: [750.0, 400.0, 250.0],
+        6: [200.0, 150.0, 100.0],
+    },
+}
+
+def _rows_scale(rows: Dict[int, List[float]], factor: float) -> Dict[int, List[float]]:
+    return {r: [round(v * factor, 6) for v in vs] for r, vs in rows.items()}
+
+def _family_of_key(full_key: str) -> str:
+    tok = full_key.split(" ")[0] if full_key else ""
+    return family_of_label_token(tok)
+
+def get_baseline_rows_for_key(product_key: str) -> Optional[Dict[int, List[float]]]:
+    """Return baseline rows for a product_key, scaling from a known baseline if needed."""
+    if product_key in BASELINE_ROWS_BY_KEY:
+        return BASELINE_ROWS_BY_KEY[product_key]
+
+    fam = _family_of_key(product_key)
+    if fam == "unknown":
+        return None
+
+    # Try to find any baseline in same family we can scale from using SCALE_FACTORS
+    if product_key in SCALE_FACTORS:
+        target_rel = SCALE_FACTORS[product_key]
+        # Prefer a natural canonical per family
+        preferred = {
+            "credit": "1CT $0.60",
+            "$1": "$1 $10",
+            "$2": "$2 $20",
+        }.get(fam)
+        candidates = []
+        for base_key, rows in BASELINE_ROWS_BY_KEY.items():
+            if _family_of_key(base_key) != fam:
+                continue
+            if base_key in SCALE_FACTORS:
+                candidates.append(base_key)
+        # Try preferred first if present, else any candidate
+        base_key = preferred if preferred in candidates else (candidates[0] if candidates else None)
+        if base_key:
+            base_rel = SCALE_FACTORS.get(base_key, 1.0)
+            if base_rel:
+                factor = target_rel / base_rel
+                return _rows_scale(BASELINE_ROWS_BY_KEY[base_key], factor)
+    return None
+
+def build_base_from_baseline(product_key: str, denom_value: float) -> Optional[Dict[str, Dict[str, float]]]:
+    rows = get_baseline_rows_for_key(product_key)
+    if not rows:
+        return None
+    fam = _family_of_key(product_key)
+    base_values: Dict[str, Dict[str, float]] = {}
+    for row_idx, labels in BASE_ROW_LABELS.items():
+        values = rows.get(row_idx)
+        if not values or len(values) != 3:
+            continue
+        for i, label in enumerate(labels):
+            v = float(values[i])
+            if fam == "credit":
+                if row_idx == 3:
+                    # row 3 is cash; convert to credits using denom_value
+                    credits = (v / denom_value) if denom_value else v
+                    base_values[label] = {"credits": round(credits, 6), "cash": round(v, 6)}
+                else:
+                    # rows 4..6 are credits
+                    base_values[label] = {"credits": round(v, 6), "cash": round(v * denom_value, 6)}
+            else:
+                # $ families treat all as cash amounts; store as credits numerically for multiplier logic
+                base_values[label] = {"credits": round(v, 6), "cash": round(v, 6)}
+    return base_values if base_values else None
+
 
 # ==============================
 # Data classes
@@ -306,6 +407,11 @@ def extract_blocks(df: pd.DataFrame) -> List[DenomBlock]:
         fam = family_of_label_token(key.split(" ")[0]) if key else "unknown"
         semantics = detect_semantics(df, start, end)
         base_vals = extract_base_values(df, start, end, denom)
+        # If table is missing bases, attempt to build from baselines/scales
+        if not base_vals and key:
+            baseline_built = build_base_from_baseline(key, denom)
+            if baseline_built:
+                base_vals = baseline_built
         derived_vals = detect_derived_values(df, start, end, base_vals, denom)
         blocks.append(
             DenomBlock(
@@ -346,7 +452,7 @@ def scale_from_canonical(blocks: List[DenomBlock]) -> Dict[str, Dict[str, Any]]:
 
         c_val = canonical.denom_value if canonical.denom_value else 1.0
         c_sem = canonical.semantics
-        c_base = canonical.base_values
+        c_base = canonical.base_values if canonical.base_values else build_base_from_baseline(canonical.key, canonical.denom_value) or {}
 
         # If canonical block lacks bases (e.g., empty), keep empty; we'll just annotate semantics
         for b in fam_blocks:
